@@ -169,6 +169,49 @@ kubectl get job <job> -n <your-namespace> -o yaml # full spec: image, resources,
 
 A finished Job (and its pod, and thus its logs) is auto-deleted after `AdditionalTimeToLive` seconds (`ttlSecondsAfterFinished`). **Bump `AdditionalTimeToLive`** in the config if you want a completed Job to linger for inspection.
 
+## 11. A real-world example: the FLARE lake forecast
+
+The tutorial workflow above is deliberately tiny. [FLARE](https://github.com/FLARE-forecast/FLAREr) (Forecasting Lake And Reservoir Ecosystems) is a real GLM-AED data-assimilation forecast — far heavier — which makes it a good end-to-end test of a Kubernetes action that does substantial compute and S3 I/O.
+
+**Shape of the workflow** — one GitHub Actions action feeding one Kubernetes action:
+
+```
+start (GitHub Actions)  ──▶  run-fcre-aed-forecast (Kubernetes)
+```
+
+- `start` runs on GitHub Actions and seeds a trivial input (it satisfies FaaSr's "entry action must be GitHub Actions with `UseSecretStore: true`" rule).
+- `run-fcre-aed-forecast` runs on the cluster and does the actual forecasting.
+
+**The container.** The Kubernetes action uses a purpose-built image that bakes in GLM+AED (built from source), the **FLAREr** R package (installed from the public [`FLARE-forecast/FLAREr`](https://github.com/FLARE-forecast/FLAREr)), and a Kubernetes-capable FaaSr engine. The forecast entry function (`run_fcre_aed_forecast`) is pulled at run time from the FCRE forecast repository via `FunctionGitRepo`.
+
+**Size the resources — FLARE is much heavier than the tutorial:**
+
+```json
+"K8s": {
+  "FaaSType": "Kubernetes",
+  "Endpoint": "https://<nrp-api-server>",
+  "Namespace": "<your-namespace>",
+  "UseSecretStore": false,
+  "AllowSelfSignedCertificate": true,
+  "SSLCertificate": "<base64 CA cert>",
+  "MaxCPU": 2000,
+  "MaxMemory": 8000,
+  "TimeLimit": 1800,
+  "AdditionalTimeToLive": 3600,
+  "NumberOfRetries": 1
+}
+```
+
+The forecast also needs its **object-store data stores** (met/inflow drivers, targets, forecast/score outputs, restart) configured with `UseSecretStore: false` so their credentials are passed into the pod — exactly as in step 8. **Register and invoke** as in steps 9–10; the GitHub Actions entry action submits one Kubernetes Job for `run-fcre-aed-forecast` into your namespace.
+
+**What happens on the cluster.** Each forecast cycle assimilates the latest observations, runs a GLM-AED ensemble forecast for one reference date, writes the forecast and its skill scores to S3, then advances one day and writes a restart. The action loops over reference dates until its internal time budget, then exits cleanly. In a bounded demo run, the Job reached `Complete 1/1` in ~12 minutes, producing **6 daily forecasts** (`reference_date=2026-05-24 … 2026-05-29`) written to the object store, and exited gracefully at its time budget (`Approaching action time budget; exiting loop cleanly with restart written`).
+
+!!! note "Long forecasts and `TimeLimit`"
+    A full multi-month backfill can run for hours. Kubernetes kills a Job at `TimeLimit` (`activeDeadlineSeconds`) with `DeadlineExceeded`. For a **bounded** run, cap the forecast's internal loop comfortably below `TimeLimit` so it exits gracefully with a restart written; for the **full** range, raise `TimeLimit`. Because each cycle persists a restart to S3, a run that stops early can be resumed simply by invoking again.
+
+!!! tip "The GLM namelist must match the GLM binary"
+    A current GLM build expects the submerged-inflow variable `subm_height` in `glm3.nml`; older FCRE configs using `subm_elev` need that variable renamed, or GLM aborts with `Base nml missing the following variable name: subm_height`.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -178,6 +221,7 @@ A finished Job (and its pod, and thus its logs) is auto-deleted after `Additiona
 | Auth error on register/invoke | The service-account token expired — re-mint (step 5) and update the `<K8sServerName>_Token` secret. |
 | Job shows `DeadlineExceeded` | The action ran longer than `TimeLimit` (or is stuck, e.g. retrying a failed S3 call). Raise `TimeLimit` or fix the underlying error. |
 | `ImagePullBackOff` on the pod | The cluster can't pull your action image — make it public or push it somewhere Nautilus can reach. |
+| GLM Job fails: `Base nml missing the following variable name: subm_height` | The GLM binary expects the current namelist schema; rename `subm_elev` → `subm_height` in your `glm3.nml`. |
 
 [Running on Kubernetes]: kubernetes.md
 [FaaSr-workflow repo]: workflow_repo.md
